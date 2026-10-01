@@ -92,6 +92,43 @@ CREATE TABLE IF NOT EXISTS reversals (
     request_key TEXT NOT NULL UNIQUE,
     reversed_at TEXT NOT NULL
 );
+
+-- 孔位隔离申请：同一事务确认所有孔已登记且尚未隔离后原子建立；
+-- 申请记录永久保留（解除后不删除），request_key 用于幂等去重。
+CREATE TABLE IF NOT EXISTS quarantine_requests (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_key TEXT NOT NULL UNIQUE,
+    case_id     TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+-- 申请涉及的孔，每孔一行；released_at 为 NULL 表示隔离中。
+-- 部分唯一索引保证同一孔同一时刻只有一条生效隔离。
+CREATE TABLE IF NOT EXISTS quarantine_wells (
+    request_id  INTEGER NOT NULL REFERENCES quarantine_requests(id),
+    well        TEXT NOT NULL,
+    released_at TEXT,
+    PRIMARY KEY (request_id, well)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_quarantine_wells_active
+    ON quarantine_wells(well) WHERE released_at IS NULL;
+
+-- 解除隔离审计：解除单独追加记录，申请记录保留（孔位行标记 released_at）。
+CREATE TABLE IF NOT EXISTS quarantine_releases (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_key TEXT NOT NULL UNIQUE,
+    case_id     TEXT NOT NULL,
+    released_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS quarantine_release_wells (
+    release_id INTEGER NOT NULL REFERENCES quarantine_releases(id),
+    well       TEXT NOT NULL,
+    request_id INTEGER NOT NULL REFERENCES quarantine_requests(id),
+    PRIMARY KEY (release_id, well)
+);
 """
 
 
@@ -134,7 +171,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
 def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     """立即写事务：BEGIN IMMEDIATE 在事务起点就取得保留锁。
 
-    所有变更端点（补液、批次、撤销）都经此进入事务，使「校验读 → 写入 →
+    所有变更端点（补液、批次、撤销、容量变更、隔离申请与解除）都经此进入
+    事务，使「校验读 → 写入 →
     提交」全程互斥串行：后到的事务在 BEGIN IMMEDIATE 处等待，待先到者
     提交后才开始读库，必然读到已提交的新状态，不会以旧快照覆盖新写入
     （例如撤销完成阻塞检查后另一请求的补液）。等不到锁由 busy_timeout

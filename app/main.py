@@ -10,7 +10,14 @@ from fastapi import Depends, FastAPI, HTTPException, Response
 
 from . import db as db_module
 from . import ledger
-from .schemas import BatchCreate, CapacityUpdate, ReversalCreate, WellCreate
+from .schemas import (
+    BatchCreate,
+    CapacityUpdate,
+    QuarantineCreate,
+    QuarantineReleaseCreate,
+    ReversalCreate,
+    WellCreate,
+)
 
 
 @asynccontextmanager
@@ -55,6 +62,16 @@ def _capacity_exceeded_detail(exc: ledger.CapacityExceeded, **extra) -> dict:
     }
 
 
+def _well_quarantined_detail(exc: ledger.WellQuarantined, **extra) -> dict:
+    """隔离冲突 409 的统一载荷：冲突孔位及其隔离案件。"""
+    return {
+        "message": str(exc),
+        "reason": "well_quarantined",
+        "quarantined_wells": exc.wells,
+        **extra,
+    }
+
+
 @app.post("/wells", status_code=201)
 def register_well(payload: WellCreate, conn: sqlite3.Connection = Depends(get_db)) -> dict:
     """登记孔位中的初始样本与体积；同一孔位重复登记视为补液混匀。
@@ -65,6 +82,8 @@ def register_well(payload: WellCreate, conn: sqlite3.Connection = Depends(get_db
         with db_module.write_transaction(conn):
             # 立即取写锁：读改写与并发撤销/批次/容量变更串行，补液不会被旧快照覆盖
             ledger.register_initial_sample(conn, payload.well, payload.sample, payload.volume)
+    except ledger.WellQuarantined as exc:
+        raise HTTPException(status_code=409, detail=_well_quarantined_detail(exc))
     except ledger.CapacityExceeded as exc:
         raise HTTPException(status_code=409, detail=_capacity_exceeded_detail(exc))
     return ledger.well_state(conn, payload.well)
@@ -87,6 +106,8 @@ def set_capacity(
             ledger.set_well_capacity(conn, well, payload.max_capacity)
     except ledger.WellNotFound:
         raise HTTPException(status_code=404, detail=f"孔位 {well} 尚未登记")
+    except ledger.WellQuarantined as exc:
+        raise HTTPException(status_code=409, detail=_well_quarantined_detail(exc))
     except ledger.CapacityConflict as exc:
         raise HTTPException(
             status_code=409,
@@ -123,6 +144,7 @@ def get_well_batches(well: str, conn: sqlite3.Connection = Depends(get_db)) -> d
     ).fetchall()
     return {
         "well": well,
+        "quarantine": ledger.well_quarantine(conn, well),
         "batches": [ledger.batch_payload(conn, row["batch_id"]) for row in rows],
     }
 
@@ -149,6 +171,10 @@ def submit_batch(
         # 补液/撤销/批次从校验开始串行
         with db_module.write_transaction(conn):
             batch_id = ledger.execute_batch(conn, payload.request_key, payload.operations)
+    except ledger.WellQuarantined as exc:
+        # 隔离冲突：液体、批次与审计均不变——不落失败批次、不消耗 request_key，
+        # 解除隔离后同键可重试
+        raise HTTPException(status_code=409, detail=_well_quarantined_detail(exc))
     except ledger.InsufficientVolume as exc:
         # 状态已回滚；把失败批次也记录下来，消耗掉这个 request_key
         try:
@@ -265,6 +291,12 @@ def reverse_batch(
                 response.status_code = 200
                 return ledger.get_reversal(conn, int(row["id"]), replayed=True)
             reversal_id = ledger.apply_reversal(conn, batch_id, payload.request_key)
+    except ledger.WellQuarantined as exc:
+        # 批次触及隔离孔：液体与审计记录不变，request_key 不消耗
+        raise HTTPException(
+            status_code=409,
+            detail=_well_quarantined_detail(exc, batch_id=batch_id),
+        )
     except ledger.ReversalConflict as exc:
         if exc.reason == "not_found":
             raise HTTPException(status_code=404, detail=exc.message)
@@ -298,3 +330,193 @@ def reverse_batch(
 
     response.status_code = 201
     return ledger.get_reversal(conn, reversal_id)
+
+
+# ---------------------------------------------------------------- 孔位隔离
+
+def _quarantine_target(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, list[str]]:
+    """隔离申请的目标：案件 + 孔位集合（同键换目标判定的依据）。"""
+    wells = [
+        r["well"]
+        for r in conn.execute(
+            "SELECT well FROM quarantine_wells WHERE request_id = ? ORDER BY well",
+            (row["id"],),
+        ).fetchall()
+    ]
+    return row["case_id"], wells
+
+
+def _release_target(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[str, list[str]]:
+    """解除记录的目标：案件 + 孔位集合。"""
+    wells = [
+        r["well"]
+        for r in conn.execute(
+            "SELECT well FROM quarantine_release_wells WHERE release_id = ? ORDER BY well",
+            (row["id"],),
+        ).fetchall()
+    ]
+    return row["case_id"], wells
+
+
+def _quarantine_replay_or_conflict(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    payload: QuarantineCreate,
+    response: Response,
+) -> dict:
+    """同键同目标（案件 + 孔位集合）按重放返回首次结果；同键换目标返回 409。"""
+    case_id, wells = _quarantine_target(conn, row)
+    if case_id == payload.case_id and wells == payload.wells:
+        response.status_code = 200
+        return ledger.quarantine_payload(conn, int(row["id"]), replayed=True)
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": (
+                f"request_key {payload.request_key} 已用于案件 {case_id} 对孔位 "
+                f"{'、'.join(wells)} 的隔离申请，不能再用于案件 "
+                f"{payload.case_id} 对 {'、'.join(payload.wells)} 的申请"
+            ),
+            "reason": "request_key_conflict",
+            "existing_case_id": case_id,
+            "existing_wells": wells,
+        },
+    )
+
+
+def _release_replay_or_conflict(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    payload: QuarantineReleaseCreate,
+    response: Response,
+) -> dict:
+    case_id, wells = _release_target(conn, row)
+    if case_id == payload.case_id and wells == payload.wells:
+        response.status_code = 200
+        return ledger.release_payload(conn, int(row["id"]), replayed=True)
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": (
+                f"request_key {payload.request_key} 已用于案件 {case_id} 对孔位 "
+                f"{'、'.join(wells)} 的解除隔离，不能再用于案件 "
+                f"{payload.case_id} 对 {'、'.join(payload.wells)} 的解除"
+            ),
+            "reason": "request_key_conflict",
+            "existing_case_id": case_id,
+            "existing_wells": wells,
+        },
+    )
+
+
+@app.post("/quarantines")
+def create_quarantine(
+    payload: QuarantineCreate,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    """提交孔位隔离申请：同一事务确认所有孔已登记且尚未隔离，原子建立隔离记录。
+
+    任一孔未登记（404）或已处于隔离状态（409 already_quarantined，逐孔列出
+    当前案件）时整次申请拒绝，不留部分状态、不消耗 request_key。
+    request_key 幂等：同键同目标返回首次结果（200），同键换目标返回 409。
+    """
+    # 事务外快速路径：无并发时直接给出重放/换目标结论，免取写锁。
+    existing = ledger.find_quarantine_by_key(conn, payload.request_key)
+    if existing is not None:
+        return _quarantine_replay_or_conflict(conn, existing, payload, response)
+
+    try:
+        # BEGIN IMMEDIATE 立即取锁：幂等复核、未隔离校验与写入持同一把锁完成，
+        # 与并发补液/批次/撤销/容量变更/其他隔离申请串行。
+        with db_module.write_transaction(conn):
+            row = ledger.find_quarantine_by_key(conn, payload.request_key)
+            if row is not None:
+                return _quarantine_replay_or_conflict(conn, row, payload, response)
+            quarantine_id = ledger.apply_quarantine(
+                conn, payload.request_key, payload.case_id, payload.reason, payload.wells
+            )
+    except ledger.WellNotFound as exc:
+        raise HTTPException(status_code=404, detail=f"孔位 {exc.well} 尚未登记，不能隔离")
+    except ledger.QuarantineConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "already_quarantined",
+                "conflicting_wells": exc.conflicts,
+            },
+        )
+    except sqlite3.IntegrityError:
+        # 兜底：极端并发下 request_key 唯一约束拦截（正常已被锁内复核覆盖）
+        row = ledger.find_quarantine_by_key(conn, payload.request_key)
+        if row is not None:
+            return _quarantine_replay_or_conflict(conn, row, payload, response)
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "隔离申请与现有隔离冲突", "reason": "already_quarantined"},
+        )
+
+    response.status_code = 201
+    return ledger.quarantine_payload(conn, quarantine_id)
+
+
+@app.post("/quarantines/releases")
+def release_quarantine(
+    payload: QuarantineReleaseCreate,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    """解除隔离：须携带对应 case_id，批量解除任一孔不匹配即整体拒绝。
+
+    每个孔都必须处于隔离状态且隔离案件与 case_id 一致，否则 409
+    release_mismatch（逐孔列出不匹配原因），整次解除不留部分状态、不消耗
+    request_key。成功后申请记录保留（孔位行标记解除时间），解除审计单独
+    追加。request_key 幂等：同键同目标返回首次结果（200），同键换目标 409。
+    """
+    existing = ledger.find_release_by_key(conn, payload.request_key)
+    if existing is not None:
+        return _release_replay_or_conflict(conn, existing, payload, response)
+
+    try:
+        with db_module.write_transaction(conn):
+            row = ledger.find_release_by_key(conn, payload.request_key)
+            if row is not None:
+                return _release_replay_or_conflict(conn, row, payload, response)
+            release_id = ledger.apply_release(
+                conn, payload.request_key, payload.case_id, payload.wells
+            )
+    except ledger.ReleaseConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "release_mismatch",
+                "mismatched_wells": exc.mismatches,
+            },
+        )
+    except sqlite3.IntegrityError:
+        row = ledger.find_release_by_key(conn, payload.request_key)
+        if row is not None:
+            return _release_replay_or_conflict(conn, row, payload, response)
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "解除隔离与现有记录冲突", "reason": "release_mismatch"},
+        )
+
+    response.status_code = 201
+    return ledger.release_payload(conn, release_id)
+
+
+@app.get("/quarantines")
+def list_quarantines(conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    """全部隔离申请记录（含各孔当前状态：隔离中 / 已解除）。"""
+    rows = conn.execute("SELECT id FROM quarantine_requests ORDER BY id").fetchall()
+    return {"quarantines": [ledger.quarantine_payload(conn, row["id"]) for row in rows]}
+
+
+@app.get("/quarantines/releases")
+def list_quarantine_releases(conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    """全部解除隔离审计记录。"""
+    rows = conn.execute("SELECT id FROM quarantine_releases ORDER BY id").fetchall()
+    return {"releases": [ledger.release_payload(conn, row["id"]) for row in rows]}

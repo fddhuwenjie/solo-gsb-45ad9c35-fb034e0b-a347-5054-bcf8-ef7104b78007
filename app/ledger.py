@@ -56,6 +56,19 @@ class CapacityConflict(Exception):
         )
 
 
+class WellQuarantined(Exception):
+    """孔位处于隔离状态：禁止补液、作为批次来源/目标、修改容量或撤销触及它的批次。
+
+    wells 为 _active_quarantine_map 命中的行（含 case_id），冲突时液体、
+    批次与审计记录均不变。
+    """
+
+    def __init__(self, wells: list[dict]) -> None:
+        self.wells = [{"well": w["well"], "case_id": w["case_id"]} for w in wells]
+        labels = "、".join(f"{w['well']}（案件 {w['case_id']}）" for w in self.wells)
+        super().__init__(f"孔位 {labels} 处于隔离状态，禁止该操作")
+
+
 def q(value: Decimal) -> Decimal:
     """量化到统一精度。quantize 单调不减，组分量不会被放大到超过原值。"""
     return value.quantize(QUANTUM, rounding=ROUND_HALF_UP)
@@ -94,12 +107,16 @@ def get_well_capacity(conn: sqlite3.Connection, well: str) -> Decimal | None:
 def set_well_capacity(conn: sqlite3.Connection, well: str, capacity: Decimal | None) -> None:
     """设置（capacity）或取消（None）孔位容量上限。
 
-    新上限低于当前体积时抛 CapacityConflict，配置保持不变；孔未登记抛
-    WellNotFound。调用方须在写事务内调用，使容量变更与补液/批次/撤销串行。
+    孔位处于隔离状态时禁止变更（抛 WellQuarantined）；新上限低于当前体积
+    时抛 CapacityConflict，配置保持不变；孔未登记抛 WellNotFound。调用方
+    须在写事务内调用，使容量变更与补液/批次/撤销/隔离变更串行。
     """
     row = conn.execute("SELECT volume FROM wells WHERE well = ?", (well,)).fetchone()
     if row is None:
         raise WellNotFound(well)
+    quarantined = _active_quarantine_map(conn, [well])
+    if quarantined:
+        raise WellQuarantined([quarantined[well]])
     volume = Decimal(row["volume"])
     if capacity is not None and capacity < volume:
         raise CapacityConflict(well, volume, capacity)
@@ -158,9 +175,12 @@ def _record_event(
 def register_initial_sample(conn: sqlite3.Connection, well: str, sample: str, volume: Decimal) -> None:
     """登记初始样本；孔位已有液体时视为补液并立即混匀。
 
-    孔位设有容量上限时，补液后的体积超过上限即抛 CapacityExceeded，
-    由调用方回滚，液体状态不变。
+    孔位处于隔离状态时禁止补液（抛 WellQuarantined）；设有容量上限时，
+    补液后的体积超过上限即抛 CapacityExceeded，由调用方回滚，液体状态不变。
     """
+    quarantined = _active_quarantine_map(conn, [well])
+    if quarantined:
+        raise WellQuarantined([quarantined[well]])
     ensure_well(conn, well)
     sample_id = ensure_sample(conn, sample)
     current = get_well_volume(conn, well)
@@ -268,6 +288,7 @@ def well_state(conn: sqlite3.Connection, well: str) -> dict | None:
         "max_capacity": (
             None if row["max_capacity"] is None else dec_str(Decimal(row["max_capacity"]))
         ),
+        "quarantine": well_quarantine(conn, well),
         "composition": composition,
     }
 
@@ -307,13 +328,20 @@ def _save_pre_batch_snapshot(conn: sqlite3.Connection, batch_id: int, wells: lis
 
 
 def execute_batch(conn: sqlite3.Connection, request_key: str, operations: list) -> int:
-    """在调用方的事务内按提交顺序执行；任一步抛 InsufficientVolume 由调用方回滚。"""
-    batch_id = insert_batch(conn, request_key, "committed")
+    """在调用方的事务内按提交顺序执行；任一步抛异常由调用方回滚整批。
+
+    任一触及孔处于隔离状态即抛 WellQuarantined——在写入任何批次记录之前，
+    因此隔离冲突不落失败批次、不消耗 request_key。
+    """
     touched_wells = list(dict.fromkeys(
         well
         for op in operations
         for well in (op.source, op.destination)
     ))
+    quarantined = _active_quarantine_map(conn, touched_wells)
+    if quarantined:
+        raise WellQuarantined([quarantined[w] for w in touched_wells if w in quarantined])
+    batch_id = insert_batch(conn, request_key, "committed")
     # 先于任何移液保存批前快照，保证与最终提交同事务、可整体回滚。
     _save_pre_batch_snapshot(conn, batch_id, touched_wells)
     for step, op in enumerate(operations, start=1):
@@ -467,7 +495,8 @@ def _restore_snapshot(conn: sqlite3.Connection, batch_id: int) -> None:
 def apply_reversal(conn: sqlite3.Connection, batch_id: int, request_key: str) -> int:
     """在调用方事务内完成可撤销性校验、快照恢复与审计记录写入。
 
-    校验不通过抛 ReversalConflict（由调用方随事务回滚，液体状态不变）。
+    校验不通过抛 ReversalConflict 或 WellQuarantined（由调用方随事务回滚，
+    液体状态不变）。
     """
     row = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
     if row is None:
@@ -491,6 +520,10 @@ def apply_reversal(conn: sqlite3.Connection, batch_id: int, request_key: str) ->
     ).fetchone():
         raise ReversalConflict("already_reversed", f"批次 {batch_id} 已经撤销，不能重复撤销")
     wells = [r["well"] for r in snaps]
+    # 隔离孔禁止撤销触及它的批次：恢复快照会改变被隔离孔的液体状态。
+    quarantined = _active_quarantine_map(conn, wells)
+    if quarantined:
+        raise WellQuarantined([quarantined[w] for w in wells if w in quarantined])
     blockers = _batch_blockers(conn, batch_id, wells)
     if blockers:
         raise ReversalConflict(
@@ -527,3 +560,189 @@ def apply_reversal(conn: sqlite3.Connection, batch_id: int, request_key: str) ->
         (batch_id, request_key, _now()),
     )
     return int(cur.lastrowid)
+
+
+# ---------------------------------------------------------------- 孔位隔离
+
+class QuarantineConflict(Exception):
+    """隔离申请冲突：部分孔已处于隔离状态（整次申请拒绝，不留部分状态）。"""
+
+    def __init__(self, conflicts: list[dict]) -> None:
+        self.conflicts = [{"well": w["well"], "case_id": w["case_id"]} for w in conflicts]
+        labels = "、".join(f"{w['well']}（案件 {w['case_id']}）" for w in self.conflicts)
+        super().__init__(f"孔位 {labels} 已处于隔离状态，整次申请拒绝")
+
+
+class ReleaseConflict(Exception):
+    """解除隔离不匹配：孔未处于隔离状态，或隔离案件与给定 case_id 不符。"""
+
+    def __init__(self, mismatches: list[dict]) -> None:
+        self.mismatches = mismatches
+        parts = []
+        for m in mismatches:
+            if m["reason"] == "not_quarantined":
+                parts.append(f"{m['well']}（未隔离）")
+            else:
+                parts.append(f"{m['well']}（隔离案件为 {m['case_id']}）")
+        super().__init__(f"孔位 {'、'.join(parts)} 与解除请求不匹配，整次解除拒绝")
+
+
+def _active_quarantine_map(conn: sqlite3.Connection, wells: list[str]) -> dict[str, dict]:
+    """这些孔中当前处于隔离状态的孔 -> 隔离信息（含 request_id/case_id/request_key）。"""
+    if not wells:
+        return {}
+    placeholders = ", ".join("?" for _ in wells)
+    rows = conn.execute(
+        "SELECT qw.well AS well, qw.request_id AS request_id, "
+        "       qr.case_id AS case_id, qr.request_key AS request_key "
+        "FROM quarantine_wells qw "
+        "JOIN quarantine_requests qr ON qr.id = qw.request_id "
+        "WHERE qw.released_at IS NULL AND qw.well IN (" + placeholders + ")",
+        list(wells),
+    ).fetchall()
+    return {row["well"]: dict(row) for row in rows}
+
+
+def well_quarantine(conn: sqlite3.Connection, well: str) -> dict | None:
+    """孔位当前隔离信息；未隔离返回 None。"""
+    row = conn.execute(
+        "SELECT qr.case_id AS case_id, qr.reason AS reason, qr.request_key AS request_key, "
+        "       qr.created_at AS quarantined_at "
+        "FROM quarantine_wells qw JOIN quarantine_requests qr ON qr.id = qw.request_id "
+        "WHERE qw.well = ? AND qw.released_at IS NULL",
+        (well,),
+    ).fetchone()
+    return None if row is None else dict(row)
+
+
+def find_quarantine_by_key(conn: sqlite3.Connection, request_key: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM quarantine_requests WHERE request_key = ?", (request_key,)
+    ).fetchone()
+
+
+def find_release_by_key(conn: sqlite3.Connection, request_key: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM quarantine_releases WHERE request_key = ?", (request_key,)
+    ).fetchone()
+
+
+def apply_quarantine(
+    conn: sqlite3.Connection,
+    request_key: str,
+    case_id: str,
+    reason: str,
+    wells: list[str],
+) -> int:
+    """在调用方事务内校验并原子建立隔离记录。
+
+    任一孔未登记（WellNotFound）或已处于隔离状态（QuarantineConflict）即抛出，
+    由调用方回滚，整次申请不留部分状态、不消耗 request_key。
+    """
+    for well in wells:
+        if get_well_volume(conn, well) is None:
+            raise WellNotFound(well)
+    active = _active_quarantine_map(conn, wells)
+    if active:
+        raise QuarantineConflict([active[w] for w in wells if w in active])
+    cur = conn.execute(
+        "INSERT INTO quarantine_requests (request_key, case_id, reason, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (request_key, case_id, reason, _now()),
+    )
+    request_id = int(cur.lastrowid)
+    conn.executemany(
+        "INSERT INTO quarantine_wells (request_id, well) VALUES (?, ?)",
+        [(request_id, well) for well in wells],
+    )
+    return request_id
+
+
+def apply_release(
+    conn: sqlite3.Connection,
+    request_key: str,
+    case_id: str,
+    wells: list[str],
+) -> int:
+    """在调用方事务内校验并原子解除隔离，追加解除审计（申请记录保留）。
+
+    任一孔未处于隔离状态或隔离案件与 case_id 不符即抛 ReleaseConflict，
+    由调用方回滚，整次解除不留部分状态、不消耗 request_key。
+    """
+    active = _active_quarantine_map(conn, wells)
+    mismatches = []
+    for well in wells:
+        row = active.get(well)
+        if row is None:
+            mismatches.append({"well": well, "reason": "not_quarantined"})
+        elif row["case_id"] != case_id:
+            mismatches.append(
+                {"well": well, "reason": "case_mismatch", "case_id": row["case_id"]}
+            )
+    if mismatches:
+        raise ReleaseConflict(mismatches)
+    now = _now()
+    cur = conn.execute(
+        "INSERT INTO quarantine_releases (request_key, case_id, released_at) VALUES (?, ?, ?)",
+        (request_key, case_id, now),
+    )
+    release_id = int(cur.lastrowid)
+    for well in wells:
+        conn.execute(
+            "UPDATE quarantine_wells SET released_at = ? "
+            "WHERE well = ? AND released_at IS NULL",
+            (now, well),
+        )
+        conn.execute(
+            "INSERT INTO quarantine_release_wells (release_id, well, request_id) "
+            "VALUES (?, ?, ?)",
+            (release_id, well, active[well]["request_id"]),
+        )
+    return release_id
+
+
+def quarantine_payload(conn: sqlite3.Connection, request_id: int, replayed: bool = False) -> dict:
+    row = conn.execute(
+        "SELECT * FROM quarantine_requests WHERE id = ?", (request_id,)
+    ).fetchone()
+    wells = conn.execute(
+        "SELECT well, released_at FROM quarantine_wells WHERE request_id = ? ORDER BY well",
+        (request_id,),
+    ).fetchall()
+    return {
+        "quarantine_id": row["id"],
+        "request_key": row["request_key"],
+        "case_id": row["case_id"],
+        "reason": row["reason"],
+        "created_at": row["created_at"],
+        "replayed": replayed,
+        "wells": [
+            {
+                "well": w["well"],
+                "status": "released" if w["released_at"] is not None else "quarantined",
+                "released_at": w["released_at"],
+            }
+            for w in wells
+        ],
+    }
+
+
+def release_payload(conn: sqlite3.Connection, release_id: int, replayed: bool = False) -> dict:
+    row = conn.execute(
+        "SELECT * FROM quarantine_releases WHERE id = ?", (release_id,)
+    ).fetchone()
+    wells = conn.execute(
+        "SELECT well, request_id FROM quarantine_release_wells WHERE release_id = ? "
+        "ORDER BY well",
+        (release_id,),
+    ).fetchall()
+    return {
+        "release_id": row["id"],
+        "request_key": row["request_key"],
+        "case_id": row["case_id"],
+        "released_at": row["released_at"],
+        "replayed": replayed,
+        "wells": [
+            {"well": w["well"], "quarantine_id": w["request_id"]} for w in wells
+        ],
+    }

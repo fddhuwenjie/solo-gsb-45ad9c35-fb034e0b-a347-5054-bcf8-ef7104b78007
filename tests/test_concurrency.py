@@ -346,3 +346,200 @@ def test_capacity_committed_first_top_up_sees_limit(client, monkeypatch):
     assert detail["max_capacity"] == "105"
     # 液体不变
     assert client.get("/wells/A1").json()["volume"] == "100"
+
+
+# ------------------------------------------------ 隔离与既有变更串行
+
+
+def quarantine(client, wells, case_id="CASE-1", request_key="q-conc"):
+    return client.post(
+        "/quarantines",
+        json={
+            "request_key": request_key,
+            "case_id": case_id,
+            "reason": "污染排查",
+            "wells": wells,
+        },
+    )
+
+
+def release(client, wells, case_id="CASE-1", request_key="rel-conc"):
+    return client.post(
+        "/quarantines/releases",
+        json={"request_key": request_key, "case_id": case_id, "wells": wells},
+    )
+
+
+def test_quarantine_committed_first_batch_sees_it(client, monkeypatch):
+    """隔离先持锁提交：批次在锁后读到隔离状态，409 且不落失败批次。"""
+    register(client, "A1", "S1", "100")
+    gate = _Gate()
+    original = ledger.apply_quarantine
+
+    def gated_quarantine(conn, request_key, case_id, reason, wells):
+        # 已在 BEGIN IMMEDIATE 之后执行：写锁在手
+        gate.entered.set()
+        assert gate.release.wait(10.0), "隔离线程未被释放"
+        return original(conn, request_key, case_id, reason, wells)
+
+    monkeypatch.setattr(ledger, "apply_quarantine", gated_quarantine)
+
+    q_thread, q_result = _run_in_thread(lambda: quarantine(client, ["A1"]))
+    gate.wait_inside()  # 隔离持锁
+
+    batch_payload = {
+        "request_key": "conc-batch",
+        "operations": [{"source": "A1", "destination": "B1", "volume": "10"}],
+    }
+    b_thread, b_result = _run_in_thread(lambda: client.post("/batches", json=batch_payload))
+    threading.Event().wait(0.3)
+    assert b_thread.is_alive(), "批次应在隔离的写锁上排队"
+
+    gate.release.set()
+    q_resp = _join(q_thread, q_result)
+    b_resp = _join(b_thread, b_result)
+
+    assert q_resp.status_code == 201, q_resp.text
+    assert b_resp.status_code == 409, b_resp.text
+    assert b_resp.json()["detail"]["reason"] == "well_quarantined"
+    # 液体、批次均不变：不落失败批次、不消耗 request_key
+    assert client.get("/wells/A1").json()["volume"] == "100"
+    assert client.get("/wells/B1").status_code == 404
+    assert client.get("/batches").json()["batches"] == []
+
+    # 解除隔离后同键批次成功
+    assert release(client, ["A1"]).status_code == 201
+    assert client.post("/batches", json=batch_payload).status_code == 201
+
+
+def test_batch_committed_first_quarantine_still_applies(client, monkeypatch):
+    """批次先持锁提交：隔离在锁后读到最新状态，正常建立（隔离不依赖液体状态）。"""
+    register(client, "A1", "S1", "100")
+    gate = _Gate()
+    original = ledger.execute_batch
+
+    def gated_batch(conn, request_key, operations):
+        gate.entered.set()
+        assert gate.release.wait(10.0), "批次线程未被释放"
+        return original(conn, request_key, operations)
+
+    monkeypatch.setattr(ledger, "execute_batch", gated_batch)
+
+    b_thread, b_result = _run_in_thread(
+        lambda: client.post(
+            "/batches",
+            json={
+                "request_key": "conc-batch-first",
+                "operations": [{"source": "A1", "destination": "B1", "volume": "10"}],
+            },
+        )
+    )
+    gate.wait_inside()  # 批次持锁
+
+    q_thread, q_result = _run_in_thread(lambda: quarantine(client, ["B1"]))
+    threading.Event().wait(0.3)
+    assert q_thread.is_alive(), "隔离应在批次的写锁上排队"
+
+    gate.release.set()
+    b_resp = _join(b_thread, b_result)
+    q_resp = _join(q_thread, q_result)
+
+    assert b_resp.status_code == 201
+    assert q_resp.status_code == 201, q_resp.text
+    assert client.get("/wells/B1").json()["quarantine"]["case_id"] == "CASE-1"
+
+
+# --------------------------------------- 隔离 request_key 并发语义
+
+
+def test_concurrent_same_key_same_target_quarantine_replays_once(client):
+    register(client, "A1", "S1", "100")
+    threads, results = [], []
+    for _ in range(2):
+        t, r = _run_in_thread(lambda: quarantine(client, ["A1"], request_key="q-idem-conc"))
+        threads.append(t)
+        results.append(r)
+    responses = [_join(t, r) for t, r in zip(threads, results)]
+
+    assert sorted(resp.status_code for resp in responses) == [200, 201]
+    bodies = [resp.json() for resp in responses]
+    assert {b["quarantine_id"] for b in bodies} == {bodies[0]["quarantine_id"]}
+    assert [b["replayed"] for b in bodies].count(True) == 1
+    assert len(client.get("/quarantines").json()["quarantines"]) == 1
+
+
+def test_concurrent_same_key_other_target_quarantine_conflicts(client):
+    register(client, "A1", "S1", "100")
+    register(client, "A2", "S2", "50")
+
+    barrier = threading.Barrier(2)
+    threads, results = [], []
+    for well in ("A1", "A2"):
+        t, r = _run_in_thread(
+            lambda well=well: (
+                barrier.wait(),
+                quarantine(client, [well], request_key="q-shared"),
+            )[1]
+        )
+        threads.append(t)
+        results.append(r)
+    responses = [_join(t, r) for t, r in zip(threads, results)]
+
+    assert sorted(resp.status_code for resp in responses) == [201, 409]
+    conflict = next(resp for resp in responses if resp.status_code == 409)
+    assert conflict.json()["detail"]["reason"] == "request_key_conflict"
+    # 只有一个申请落库，另一孔未被隔离
+    quarantines = client.get("/quarantines").json()["quarantines"]
+    assert len(quarantines) == 1
+    isolated = quarantines[0]["wells"][0]["well"]
+    other = "A2" if isolated == "A1" else "A1"
+    assert client.get(f"/wells/{other}").json()["quarantine"] is None
+
+
+def test_concurrent_quarantine_same_well_one_wins(client):
+    """不同键同时隔离同一孔：先提交者成功，后到者在锁内看到已隔离并整次拒绝。"""
+    register(client, "A1", "S1", "100")
+
+    barrier = threading.Barrier(2)
+    threads, results = [], []
+    for case_id, key in (("CASE-1", "q-race-1"), ("CASE-2", "q-race-2")):
+        t, r = _run_in_thread(
+            lambda case_id=case_id, key=key: (
+                barrier.wait(),
+                quarantine(client, ["A1"], case_id=case_id, request_key=key),
+            )[1]
+        )
+        threads.append(t)
+        results.append(r)
+    responses = [_join(t, r) for t, r in zip(threads, results)]
+
+    assert sorted(resp.status_code for resp in responses) == [201, 409]
+    conflict = next(resp for resp in responses if resp.status_code == 409)
+    detail = conflict.json()["detail"]
+    assert detail["reason"] == "already_quarantined"
+    assert detail["conflicting_wells"][0]["well"] == "A1"
+    # 只有一条生效隔离
+    quarantines = client.get("/quarantines").json()["quarantines"]
+    assert len(quarantines) == 1
+    assert client.get("/wells/A1").json()["quarantine"]["case_id"] == (
+        quarantines[0]["case_id"]
+    )
+
+
+def test_concurrent_same_key_release_replays_once(client):
+    register(client, "A1", "S1", "100")
+    assert quarantine(client, ["A1"], request_key="q-for-rel").status_code == 201
+
+    threads, results = [], []
+    for _ in range(2):
+        t, r = _run_in_thread(lambda: release(client, ["A1"], request_key="rel-idem-conc"))
+        threads.append(t)
+        results.append(r)
+    responses = [_join(t, r) for t, r in zip(threads, results)]
+
+    assert sorted(resp.status_code for resp in responses) == [200, 201]
+    bodies = [resp.json() for resp in responses]
+    assert {b["release_id"] for b in bodies} == {bodies[0]["release_id"]}
+    assert [b["replayed"] for b in bodies].count(True) == 1
+    assert client.get("/wells/A1").json()["quarantine"] is None
+    assert len(client.get("/quarantines/releases").json()["releases"]) == 1
