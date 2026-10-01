@@ -6,6 +6,7 @@
 - 一批移液操作**按提交顺序在单个事务中原子执行**：每次吸取按来源孔的组成占比带走各初始样本，目标孔按现有液体与新增液体重新混合；**任一步体积不足，整批回滚**；
 - 孔位可设**可选最大容量**（默认不限，既有数据自动视为不限）：补液与批次移液在**每一步**按目标孔当时体积校验上限，超限即 409（批次整批回滚）；撤销前同样核对快照恢复后的各孔体积，任一孔超过当前上限即整次拒绝；容量设置/取消与补液、批次、撤销串行；
 - 按孔查询当前体积、各初始样本占比，以及涉及该孔的完整批次记录；
+- **孔位异常隔离**：操作员可对一组**已登记孔**凭 `case_id` / `reason` / `request_key` 原子建立隔离——同一事务确认全部孔尚未隔离后才落记录，任一孔已被（其他案件或同案件）占用即整次拒绝，不留部分状态；同键同目标重放返回首次结果、同键换案件/换孔集合返回 `409`；隔离孔不得补液、作为批次来源或目标、修改容量，也不得撤销触及它的已提交批次（冲突时液体、批次与审计均不变）；解除隔离同样携带 `case_id` 与 `request_key`，批量解除中任一孔未隔离或案件不符即整体拒绝；申请与解除审计永久保留，孔位与批次查询返回当前隔离信息；
 - **误操作批次撤销**：成功提交的批次在同一事务保存其首次触及各孔的批前快照，可原子恢复；仅当批次已提交、尚未撤销且之后没有补液或后续批次触及这些孔时允许撤销，原批次保留并追加审计记录；
 - 所有体积运算使用 `Decimal`（统一量化到小数点后 9 位），不使用 float；
 - 通过 `request_key` 幂等去重：相同键重复提交不会重复执行，直接返回首个结果（失败批次同样被记录并消耗该键）；批次撤销同样以 `request_key` 幂等：同键同目标返回首次结果，同键换目标返回 `409`。
@@ -48,6 +49,8 @@ pytest                                       # 运行测试
 | `POST` | `/batches` | 原子执行一批移液（`request_key` 幂等） |
 | `GET` | `/batches` / `/batches/{id}` | 全部 / 单个批次记录（含失败批次） |
 | `POST` | `/batches/{id}/reversals` | 撤销已提交批次：原子恢复批前快照（`request_key` 幂等） |
+| `POST` | `/quarantines` | 按案件原子隔离一组已登记孔（`case_id` / `reason` / `request_key` 幂等） |
+| `POST` | `/quarantines/releases` | 按案件原子解除一组隔离孔（`case_id` / `request_key` 幂等） |
 
 孔位标签为「字母 + 数字」（如 `A1`、`B12`），不区分大小写；本服务按单块板建模。
 
@@ -148,6 +151,69 @@ curl -s -X PUT http://localhost:8000/wells/B1/capacity \
 #        液体与审计记录不变；调大/取消上限后同 request_key 可重试
 ```
 
+### 孔位异常隔离与冲突
+
+```bash
+# 14. 把一组已登记孔按案件原子隔离（reason 记录异常原因）
+curl -s -X POST http://localhost:8000/quarantines \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "wells": ["B1", "C1"],
+        "case_id": "CASE-2026-10-01-07",
+        "reason": "移液器吸头疑似触碰孔壁，等待复测",
+        "request_key": "quarantine-2026-10-01-001"
+      }'
+# => 201 {"action":"quarantine","quarantine_id":1,"case_id":"CASE-2026-10-01-07",
+#         "wells":[{"well":"B1","active":true,"released_at":null,
+#                   "release_request_key":null}, ...], ...}
+
+# 15. 隔离孔禁止补液 / 批次（来源或目标）/ 改容量 / 撤销触及它的批次
+#     -> 409 well_quarantined，逐个列出隔离孔、案件与隔离申请 request_key；
+#        液体、批次与审计均不变，且批次 request_key 不被消耗
+curl -s -X POST http://localhost:8000/wells \
+  -H 'Content-Type: application/json' \
+  -d '{"well": "B1", "sample": "S1", "volume": "5"}'
+# => 409 {"detail":{"reason":"well_quarantined",
+#         "quarantined_wells":[{"well":"B1","case_id":"CASE-2026-10-01-07",
+#                              "quarantine_id":1,"request_key":"quarantine-2026-10-01-001"}], ...}}
+
+# 16. 任一孔已被其他案件（或同一案件）隔离 -> 整次申请 409，同批其他孔不留部分状态
+#     未登记孔则返回 404 unknown_well
+curl -s -X POST http://localhost:8000/quarantines \
+  -H 'Content-Type: application/json' \
+  -d '{"wells": ["A1", "B1"], "case_id": "CASE-OTHER",
+       "reason": "另一案件", "request_key": "quarantine-2026-10-01-002"}'
+# => 409 {"detail":{"reason":"already_quarantined",
+#         "quarantined_wells":[{"well":"B1","case_id":"CASE-2026-10-01-07", ...}]}}
+
+# 17. 同键同目标重放 -> 200 replayed=true；同键换案件或换孔集合 -> 409
+curl -s -X POST http://localhost:8000/quarantines \
+  -H 'Content-Type: application/json' \
+  -d '{"wells": ["B1"], "case_id": "CASE-OTHER",
+       "reason": "换目标", "request_key": "quarantine-2026-10-01-001"}'
+# => 409 {"detail":{"reason":"request_key_conflict","action":"quarantine",
+#         "existing_case_id":"CASE-2026-10-01-07","existing_wells":["B1","C1"]}}
+
+# 18. 查询孔位/批次即返回当前隔离信息（GET /wells/B1 的 "quarantine" 字段；
+#     GET /wells/B1/batches 顶层 "quarantine" 与每个批次的 "quarantined_wells"）
+curl -s http://localhost:8000/wells/B1
+# => {"well":"B1","volume":"70",...,"quarantine":{"case_id":"CASE-2026-10-01-07",
+#         "reason":"...","quarantine_id":1,"request_key":"quarantine-2026-10-01-001",
+#         "quarantined_at":"2026-10-01T..."}}
+
+# 19. 解除隔离：每个孔都必须当前由该 case_id 隔离；任一不匹配整批拒绝（409，
+#     mismatched_wells 逐孔给出 not_quarantined / case_mismatch）
+curl -s -X POST http://localhost:8000/quarantines/releases \
+  -H 'Content-Type: application/json' \
+  -d '{"wells": ["B1", "C1"], "case_id": "CASE-2026-10-01-07",
+       "request_key": "release-2026-10-01-001"}'
+# => 201 {"action":"release","release_id":1,"wells":[{"well":"B1",
+#         "quarantine_request_key":"quarantine-2026-10-01-001","reason":"...", ...}]}
+# 解除同样幂等：同键同目标 -> 200 replayed=true；换目标 -> 409 request_key_conflict。
+# 成功后孔位/批次查询不再返回隔离信息；申请与解除审计均保留（重放申请可看到
+# released_at 与 release_request_key），解除后可被新案件重新隔离。
+```
+
 ## 设计要点
 
 - **Decimal 精度**：体积与组分量在库中以 TEXT 存 Decimal 字符串，运算全部走 `decimal.Decimal`，结果统一量化到 9 位小数（`ROUND_HALF_UP`），接口返回值中的数字均为字符串以避免 JSON 精度损失。
@@ -162,7 +228,14 @@ curl -s -X PUT http://localhost:8000/wells/B1/capacity \
   - 撤销 `request_key` 幂等：同键同目标返回首次撤销结果（`replayed=true`，HTTP 200），同键换目标返回 `409`；
   - 上线前已提交、没有快照的批次明确返回 `409 no_snapshot`，不可撤销。
   - 「后续操作」的判定基于孔位事件表 `well_events`（补液与批次提交各记一条，自增 id 即发生顺序）：以**本批次在该孔上的事件 id** 为基准，只统计之后的事件。
-- **状态码**：登记/批次成功/撤销成功 `201`；容量设置/取消成功 `200`；幂等重放 `200`；体积不足、容量超限或撤销冲突 `409`；孔位/批次不存在 `404`；参数非法 `422`。
+- **孔位异常隔离**：三张表——`quarantine_requests`（申请：`request_key` 唯一、案件、原因）、`quarantine_releases`（解除：`request_key` 唯一、案件）、`quarantines`（每孔一条明细，`released_at IS NULL` 即隔离中，解除只置 `released_at`/`release_id` 不删行；`well` 外键 `ON DELETE CASCADE`，使撤销批次删除批次新建孔时其隔离明细在同一撤销事务内随孔清除）。
+  - 申请（`POST /quarantines`）在单个 `BEGIN IMMEDIATE` 事务内：先确认全部孔已登记（否则 `404 unknown_well`）、全部孔当前无有效隔离（否则 `409 already_quarantined`，`quarantined_wells` 列出占用孔与其案件/隔离键），再插入申请行与每孔明细——任一条件不符整事务回滚，**不留下申请行或部分孔隔离**，`request_key` 也不被消耗；
+  - 解除（`POST /quarantines/releases`）同事务核对每个孔当前有效隔离且案件匹配：未隔离/未登记为 `not_quarantined`、案件不符为 `case_mismatch`（`mismatched_wells` 逐孔列出），任一不匹配整体回滚，任何孔都不解除；解除可横跨同一案件的多次申请；
+  - 幂等语义与撤销一致：隔离/解除键各自独立命名空间，同键同案件且**孔集合相同**（与顺序无关）返回首次结果（`replayed=true`，HTTP 200），换案件或换孔集合返回 `409 request_key_conflict`（载荷带原案件与原孔集合）；冲突回滚不消耗键；
+  - 隔离孔在补液、批次（执行前对全部来源/目标孔一次性校验，先于批次行写入与快照保存）、容量变更、批次撤销四处被拒绝（`409 well_quarantined`，`quarantined_wells` 列出涉及孔）：冲突事务整体回滚，液体、批次、隔离与审计均不变；批次场景**不**落失败批次、**不**消耗批次 `request_key`，撤销场景同键在隔离解除后可重试；
+  - 查询：`GET /wells/{well}` 返回 `quarantine`（案件、原因、隔离键、隔离时间）或 `null`；`GET /wells/{well}/batches` 顶层带 `quarantine`，批次载荷新增 `quarantined_wells`（仅列当前仍隔离的相关孔），解除后这些字段同步消失。申请与解除审计永久保留（解除后重放申请可见 `active=false`、`released_at` 与 `release_request_key`），解除后孔可被新案件重新隔离；
+  - 隔离/解除与补液、批次、撤销、容量变更共用同一把保留写锁串行：先提交者决定后提交者看到的隔离状态。
+- **状态码**：登记/批次成功/撤销成功/隔离申请成功/解除成功 `201`；容量设置/取消成功 `200`；幂等重放 `200`；体积不足、容量超限、撤销冲突或触及隔离孔 `409`；孔位/批次不存在（含隔离未登记孔）`404`；参数非法 `422`。
 
 ## 项目结构
 

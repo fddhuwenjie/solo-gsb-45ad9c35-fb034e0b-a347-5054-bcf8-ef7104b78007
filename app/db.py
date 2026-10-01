@@ -92,6 +92,41 @@ CREATE TABLE IF NOT EXISTS reversals (
     request_key TEXT NOT NULL UNIQUE,
     reversed_at TEXT NOT NULL
 );
+
+-- 孔位异常隔离：一次申请（quarantine_requests）覆盖多个已登记孔，
+-- 解除（quarantine_releases）可跨同一案件的多次申请；两类审计行永久保留。
+CREATE TABLE IF NOT EXISTS quarantine_requests (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_key TEXT NOT NULL UNIQUE,
+    case_id     TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS quarantine_releases (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_key TEXT NOT NULL UNIQUE,
+    case_id     TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+-- 每孔一条隔离明细：解除时只置 released_at/release_id，行保留作审计。
+-- released_at IS NULL 即该孔当前处于隔离中；申请互斥保证每孔至多一条有效行。
+CREATE TABLE IF NOT EXISTS quarantines (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id  INTEGER NOT NULL REFERENCES quarantine_requests(id),
+    -- ON DELETE CASCADE：撤销批次时会把批次新建的孔整体删除（快照语义），
+    -- 其隔离审计行随孔在同一撤销事务内一并删除，不违反外键约束。
+    well        TEXT NOT NULL REFERENCES wells(well) ON DELETE CASCADE,
+    case_id     TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    released_at TEXT,
+    release_id  INTEGER REFERENCES quarantine_releases(id),
+    UNIQUE(request_id, well)
+);
+
+CREATE INDEX IF NOT EXISTS idx_quarantines_active
+    ON quarantines(well) WHERE released_at IS NULL;
 """
 
 

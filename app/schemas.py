@@ -90,3 +90,78 @@ class CapacityUpdate(BaseModel):
     """设置或取消孔位最大容量：正数表示上限，null 表示取消（不限容量）。"""
 
     max_capacity: Decimal | None = Field(default=None, gt=0)
+
+
+def _case_id(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError("case_id 不能为空")
+    return value
+
+
+class QuarantineCreate(BaseModel):
+    """把一组已登记孔按案件隔离；request_key 用于隔离申请的幂等去重。"""
+
+    wells: list[str] = Field(min_length=1, max_length=384)
+    case_id: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=512)
+    request_key: str = Field(min_length=1, max_length=128)
+
+    @field_validator("wells")
+    @classmethod
+    def _wells(cls, values: list[str]) -> list[str]:
+        # 归一化 + 去重（保留首次出现顺序），同一申请重复列出同一孔无意义
+        seen: dict[str, None] = {}
+        for value in values:
+            seen.setdefault(normalize_well(value), None)
+        return list(seen)
+
+    @field_validator("case_id")
+    @classmethod
+    def _case(cls, value: str) -> str:
+        return _case_id(value)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("reason 不能为空")
+        return value
+
+    @field_validator("request_key")
+    @classmethod
+    def _key(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("request_key 不能为空")
+        return value
+
+
+class QuarantineReleaseCreate(BaseModel):
+    """解除一组当前由该案件隔离的孔；request_key 用于解除操作的幂等去重。"""
+
+    wells: list[str] = Field(min_length=1, max_length=384)
+    case_id: str = Field(min_length=1, max_length=128)
+    request_key: str = Field(min_length=1, max_length=128)
+
+    @field_validator("wells")
+    @classmethod
+    def _wells(cls, values: list[str]) -> list[str]:
+        seen: dict[str, None] = {}
+        for value in values:
+            seen.setdefault(normalize_well(value), None)
+        return list(seen)
+
+    @field_validator("case_id")
+    @classmethod
+    def _case(cls, value: str) -> str:
+        return _case_id(value)
+
+    @field_validator("request_key")
+    @classmethod
+    def _key(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("request_key 不能为空")
+        return value
